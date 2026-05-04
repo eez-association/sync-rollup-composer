@@ -27,12 +27,12 @@ services:
       - "4001:3000"   # L2 Explorer Frontend
     environment:
       NEXT_PUBLIC_API_HOST: ${BLOCKSCOUT_L2_HOST:-l2.eez.dev}
-      NEXT_PUBLIC_API_PORT: "443"
-      NEXT_PUBLIC_API_PROTOCOL: https
+      NEXT_PUBLIC_API_PORT: "${BLOCKSCOUT_L2_PORT:-443}"
+      NEXT_PUBLIC_API_PROTOCOL: ${BLOCKSCOUT_L2_PROTOCOL:-https}
       NEXT_PUBLIC_API_WEBSOCKET_PROTOCOL: wss
       NEXT_PUBLIC_APP_HOST: ${BLOCKSCOUT_L2_HOST:-l2.eez.dev}
-      NEXT_PUBLIC_APP_PORT: "443"
-      NEXT_PUBLIC_APP_PROTOCOL: https
+      NEXT_PUBLIC_APP_PORT: "${BLOCKSCOUT_L2_PORT:-443}"
+      NEXT_PUBLIC_APP_PROTOCOL: ${BLOCKSCOUT_L2_PROTOCOL:-https}
 
   # Contract verification — runs after explorers are up, verifies all contracts
   verify-contracts:
