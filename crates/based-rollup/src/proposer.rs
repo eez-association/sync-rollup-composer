@@ -226,6 +226,15 @@ impl Proposer {
         })
     }
 
+    /// Whether postBatch submission goes through `eth_sendBundle` to a
+    /// builder RPC (true) or through `eth_sendRawTransaction` to the
+    /// public mempool (false). Used by the driver to decide whether to
+    /// pre-bundle queued user L1 txs into postBatch's bundle (atomic
+    /// inclusion) or to forward them separately after submission.
+    pub fn uses_bundle_submission(&self) -> bool {
+        self.builder_http.is_some() && self.config.l1_builder_rpc_url.is_some()
+    }
+
     /// Read the on-chain state root from the Rollups contract for this rollup.
     pub async fn last_submitted_state_root(&self) -> Result<B256> {
         let calldata = rollupsCall {
@@ -527,6 +536,15 @@ impl Proposer {
         blocks: &[PendingBlock],
         cross_chain_entries: &[CrossChainExecutionEntry],
         gas_price_hint: Option<GasPriceHint>,
+        // Pre-signed user L1 txs (e.g., bridgeEther forwards from the L1
+        // composer RPC) to include atomically with the postBatch. In bundle
+        // mode they go into the same `eth_sendBundle.txs` array as postBatch,
+        // guaranteeing they share `(parent_hash, block.timestamp)` and the
+        // contract's same-block-atomicity invariant holds. In raw mode they
+        // are ignored here — the caller forwards them separately via
+        // `forward_queued_l1_txs` (acceptable on a controlled L1 like
+        // reth --dev where the proposer drives block production).
+        bundled_user_txs: &[Bytes],
     ) -> Result<B256> {
         if blocks.is_empty() && cross_chain_entries.is_empty() {
             return Err(eyre::eyre!("nothing to submit"));
@@ -623,12 +641,26 @@ impl Proposer {
             // `eth_sendBundle` targeting `proof_ctx.target_block_number`.
             // Bundle is either included in that block or silently dropped —
             // matching the proof's committed `(parent_hash, timestamp)`.
-            self.send_via_bundle(&tx, proof_ctx.target_block_number, http, url)
-                .await
-                .map_err(|err| {
-                    warn!(target: "based_rollup::proposer", %err, "failed to submit bundle to builder RPC");
-                    err
-                })?
+            //
+            // User txs (forwarded from the L1 composer RPC) ride in the same
+            // bundle so they share `(parent_hash, block.timestamp)` with
+            // postBatch. This is the only way to guarantee
+            // `lastStateUpdateBlock == block.number` when the user's
+            // executeCrossChainCall runs — without bundling, the user tx
+            // would land in some later block via the public mempool and
+            // revert with `ExecutionNotInCurrentBlock()`.
+            self.send_via_bundle(
+                &tx,
+                proof_ctx.target_block_number,
+                http,
+                url,
+                bundled_user_txs,
+            )
+            .await
+            .map_err(|err| {
+                warn!(target: "based_rollup::proposer", %err, "failed to submit bundle to builder RPC");
+                err
+            })?
         } else {
             // Standard `eth_sendRawTransaction` path: tx enters public mempool
             // and lands in whichever block the next proposer picks it up in.
@@ -683,6 +715,12 @@ impl Proposer {
         target_block_number: u64,
         http: &reqwest::Client,
         url: &str,
+        // Additional pre-signed raw txs to include in the same bundle, after
+        // postBatch. Used for L1 user txs forwarded from the composer RPC so
+        // they share `(parent_hash, block.timestamp)` with the postBatch and
+        // satisfy the contract's `lastStateUpdateBlock == block.number`
+        // invariant in `executeCrossChainCall`.
+        additional_user_txs: &[Bytes],
     ) -> Result<B256> {
         // Fill in any fields not already supplied by the caller.
         let chain_id = self.provider.get_chain_id().await?;
@@ -771,13 +809,24 @@ impl Proposer {
         let tx_hash = *envelope.tx_hash();
 
         let raw_hex = format!("0x{}", alloy_primitives::hex::encode(&raw_bytes));
+        // Build the bundle's `txs` array: postBatch first (must run before
+        // any user tx so `lastStateUpdateBlock = block.number` is set), then
+        // forwarded user txs in order.
+        let mut bundle_txs: Vec<String> = Vec::with_capacity(1 + additional_user_txs.len());
+        bundle_txs.push(raw_hex);
+        for user_tx in additional_user_txs {
+            bundle_txs.push(format!(
+                "0x{}",
+                alloy_primitives::hex::encode(user_tx.as_ref())
+            ));
+        }
         let target_hex = format!("0x{:x}", target_block_number);
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "eth_sendBundle",
             "params": [{
-                "txs": [raw_hex],
+                "txs": bundle_txs,
                 "blockNumber": target_hex,
             }],
         });
@@ -949,7 +998,9 @@ impl Proposer {
         if blocks.is_empty() && cross_chain_entries.is_empty() {
             return Ok(0);
         }
-        let tx_hash = self.send_to_l1(blocks, cross_chain_entries, None).await?;
+        let tx_hash = self
+            .send_to_l1(blocks, cross_chain_entries, None, &[])
+            .await?;
         self.wait_for_l1_receipt(tx_hash).await
     }
 

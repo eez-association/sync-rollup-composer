@@ -11,7 +11,7 @@ use super::pending_queue::PendingL1SubmissionQueue;
 use crate::cross_chain::CrossChainExecutionEntry;
 use crate::driver::hold::EntryVerificationHold;
 use crate::proposer::{GasPriceHint, PendingBlock, Proposer};
-use alloy_primitives::B256;
+use alloy_primitives::{B256, Bytes};
 use std::marker::PhantomData;
 
 // ──────────────────────────────────────────────
@@ -285,12 +285,20 @@ impl<S: Sendable> FlushPlan<S> {
         self,
         proposer: &Proposer,
         gas_hint: Option<GasPriceHint>,
+        // Pre-signed L1 user txs (bridgeEther, etc. forwarded from the L1
+        // composer RPC) to bundle atomically with postBatch in bundle mode.
+        // In raw-RPC mode these are ignored; the caller forwards them
+        // separately. Empty slice if none.
+        bundled_user_txs: &[Bytes],
     ) -> SendResult {
         let Self {
             blocks, pending_l1, ..
         } = self;
         let entries_slice: &[CrossChainExecutionEntry] = &pending_l1.entries;
-        match proposer.send_to_l1(&blocks, entries_slice, gas_hint).await {
+        match proposer
+            .send_to_l1(&blocks, entries_slice, gas_hint, bundled_user_txs)
+            .await
+        {
             Ok(tx_hash) => SendResult::Ok { tx_hash },
             Err(error) => SendResult::Failed {
                 error,

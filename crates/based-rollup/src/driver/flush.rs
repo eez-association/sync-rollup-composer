@@ -727,6 +727,35 @@ where
         // touching the hold field at all — invariant #1 only applies
         // when there are actual entries).
         let gas_hint = self.compute_gas_overbid();
+        // Only drain queued user L1 txs when we are about to submit a Collected
+        // plan in bundle mode. Otherwise leave the queue alone:
+        //   - has_entries=false: blocks-only flush, no executeCrossChainCall
+        //     piggybacking. Draining here would silently drop the user tx
+        //     since the NoEntries path passes `&[]` to send_to_l1.
+        //   - raw-RPC mode (reth --dev): post-submit `forward_queued_l1_txs`
+        //     handles them; the proposer also drives block production so they
+        //     land in the same block as postBatch by construction.
+        //
+        // Atomicity rationale (bundle mode + has_entries): forwarded user txs
+        // (e.g. bridgeEther from the L1 composer RPC) MUST share
+        // `(parent_hash, block.timestamp)` with the postBatch. If they enter
+        // public mempool separately they land in a later block and the
+        // contract's `lastStateUpdateBlock == block.number` invariant in
+        // `executeCrossChainCall` reverts with
+        // `ExecutionNotInCurrentBlock()`. Including them in the same
+        // `eth_sendBundle.txs` array makes both land or both drop together.
+        // On submit failure we restore the drained txs to the front of the
+        // queue (see `SendResult::Failed` arm).
+        let bundled_user_txs: Vec<Bytes> =
+            if has_entries && proposer.uses_bundle_submission() {
+                let mut q = self
+                    .pending_l1_forward_txs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                q.drain(..).collect()
+            } else {
+                Vec::new()
+            };
         let send_result = if has_entries {
             let plan = FlushPlan::<Collected>::new_collected(blocks, pending_l1_owned)
                 .arm_hold(&mut self.hold);
@@ -734,12 +763,13 @@ where
                 target: "based_rollup::driver",
                 l2_block = ?plan.block_count(),
                 entry_count = plan.entry_count(),
+                bundled_user_tx_count = bundled_user_txs.len(),
                 "setting entry verification hold before L1 submission (§4f nonce safety, FlushPlan<HoldArmed>)"
             );
-            plan.submit_via(proposer, gas_hint).await
+            plan.submit_via(proposer, gas_hint, &bundled_user_txs).await
         } else {
             let plan = FlushPlan::<NoEntries>::new_blocks_only(blocks);
-            plan.submit_via(proposer, gas_hint).await
+            plan.submit_via(proposer, gas_hint, &[]).await
         };
 
         // Unpack the `SendResult` into the legacy `Result<B256>`
@@ -749,6 +779,18 @@ where
         let (send_result, rollback) = match send_result {
             SendResult::Ok { tx_hash } => (Ok::<B256, eyre::Report>(tx_hash), None),
             SendResult::Failed { error, rollback } => {
+                // Submit failed — restore the user txs we drained earlier so
+                // the next flush attempt can include them in its bundle.
+                if !bundled_user_txs.is_empty() {
+                    let mut q = self
+                        .pending_l1_forward_txs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    // Preserve original order: drained txs go back to the front.
+                    let mut restored = bundled_user_txs.clone();
+                    restored.extend(q.drain(..));
+                    *q = restored;
+                }
                 (Err::<B256, eyre::Report>(error), Some(rollback))
             }
         };
